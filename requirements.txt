@@ -4,3 +4,4 @@ yt-dlp
 python-dotenv
 ffmpeg-python
 PyNaCl
+flask
