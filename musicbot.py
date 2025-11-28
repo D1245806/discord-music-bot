@@ -679,12 +679,17 @@ async def recommend_cmd(interaction: discord.Interaction):
 # ============================================================
 @bot.event
 async def on_ready():
-    await tree.sync()
-    print(f"🤖 已登入：{bot.user} (ID: {bot.user.id})")
+    synced = await tree.sync(guild=None)
+    print(f"✨ 已全域同步 {len(synced)} 個指令")
+    print(f"🤖 已登入：{bot.user}（ID: {bot.user.id}）")
 
-    # 啟動自動斷線背景任務
+    print("📋 Bot 所在伺服器：")
+    for g in bot.guilds:
+        print(f"- {g.name} (ID: {g.id})")
+
     if not hasattr(bot, "auto_dc_task"):
         bot.auto_dc_task = bot.loop.create_task(auto_disconnect_loop())
+
 
 
 if __name__ == "__main__":
