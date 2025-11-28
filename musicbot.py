@@ -673,13 +673,51 @@ async def recommend_cmd(interaction: discord.Interaction):
 
     await interaction.response.send_message(f"🤖 推薦你再聽一次：**{chosen_title}**（依照播放次數推薦）")
 
+# ============================================================
+# Bot 主人 ID（必須填你的）
+# ============================================================
+BOT_OWNER_ID = 477325882881605635   # <<< 這是你給的，已填好
+
+
+# ============================================================
+# ⭐ 啟動時自動私訊 Bot 加入的伺服器清單
+# ============================================================
+async def notify_owner_server_list():
+    try:
+        owner = await bot.fetch_user(BOT_OWNER_ID)
+    except Exception as e:
+        print(f"❌ 取得 Bot Owner 失敗：{e}")
+        return
+
+    if not owner:
+        print("❌ 找不到 Bot 擁有者（BOT_OWNER_ID 是否填錯？）")
+        return
+
+    if not bot.guilds:
+        msg = "🤖 你的機器人目前沒有加入任何伺服器。"
+        try:
+            await owner.send(msg)
+        except:
+            pass
+        print(msg)
+        return
+
+    lines = [f"- {g.name} (ID: {g.id})" for g in bot.guilds]
+    text = "📋 **你的機器人目前加入的伺服器：**\n" + "\n".join(lines)
+
+    try:
+        await owner.send(text)
+        print("📩 已透過 DM 傳送伺服器清單給 Bot Owner")
+    except Exception as e:
+        print(f"❌ 私訊 Owner 失敗：{e}")
+
 
 # ============================================================
 # Bot 啟動事件
 # ============================================================
 @bot.event
 async def on_ready():
-    synced = await tree.sync(guild=None)
+    synced = await tree.sync()
     print(f"✨ 已全域同步 {len(synced)} 個指令")
     print(f"🤖 已登入：{bot.user}（ID: {bot.user.id}）")
 
@@ -687,6 +725,10 @@ async def on_ready():
     for g in bot.guilds:
         print(f"- {g.name} (ID: {g.id})")
 
+    # 🔥 上線後自動私訊你伺服器清單
+    await notify_owner_server_list()
+
+    # 自動斷線背景任務
     if not hasattr(bot, "auto_dc_task"):
         bot.auto_dc_task = bot.loop.create_task(auto_disconnect_loop())
 
