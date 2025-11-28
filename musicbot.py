@@ -1,6 +1,7 @@
 import os
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional
 
 import discord
 from discord import app_commands
@@ -14,7 +15,7 @@ import yt_dlp
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# 可選：如果你自己在本機或 Railway 想改 ffmpeg 路徑，可以設 FFMPEG_PATH
+# Railway / Docker 預設 ffmpeg 路徑
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
 
 # ============================================================
@@ -23,6 +24,7 @@ FFMPEG_PATH = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
+intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
@@ -30,9 +32,8 @@ tree = bot.tree
 # ============================================================
 # yt-dlp & ffmpeg 設定
 # ============================================================
-YDL_OPTS = {
+YDL_OPTS_BASE = {
     "format": "bestaudio/best",
-    "noplaylist": True,
     "quiet": True,
     "nocheckcertificate": True,
 }
@@ -46,70 +47,71 @@ FFMPEG_OPTS = {
 # ============================================================
 # 狀態儲存（依 guild 分開）
 # ============================================================
-queues: dict[int, list[dict]] = {}         # guild_id -> [track, ...]
-now_playing: dict[int, dict | None] = {}   # guild_id -> track
-loop_flags: dict[int, bool] = {}           # guild_id -> 是否單曲循環
-start_times: dict[int, datetime | None] = {}  # guild_id -> 播放開始時間 (UTC)
+Track = Dict[str, Optional[str]]
+
+queues: Dict[int, List[Track]] = {}          # guild_id -> [track, ...]
+now_playing: Dict[int, Optional[Track]] = {} # guild_id -> track
+loop_flags: Dict[int, bool] = {}             # guild_id -> 是否單曲循環
+start_times: Dict[int, Optional[datetime]] = {}
+volume_settings: Dict[int, float] = {}       # 0.0 ~ 2.0，預設 1.0
+last_active: Dict[int, datetime] = {}        # 最後活躍時間
+
+# 播放歷史 & 次數統計
+history: Dict[int, List[Track]] = {}         # guild_id -> 最近播放列表
+play_counts: Dict[int, Dict[str, int]] = {}  # guild_id -> title -> count
 
 
 # ============================================================
-# 工具：Spotify 連結轉成 YouTube 搜尋
+# 小工具：更新最後活躍時間
+# ============================================================
+def touch_active(guild_id: int):
+    last_active[guild_id] = datetime.now(timezone.utc)
+
+
+# ============================================================
+# 小工具：Spotify 連結轉 YouTube 搜尋
 # ============================================================
 def maybe_convert_spotify_to_search(query: str) -> str:
-    """
-    如果是 Spotify 歌曲連結，就用 yt-dlp 抓歌名，轉成 ytsearch: 查 YouTube。
-    （不直接從 Spotify 播放，只用來查歌名）
-    """
     if "open.spotify.com/track" not in query:
         return query
-
-    try:
-        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
-            info = ydl.extract_info(query, download=False)
-        title = info.get("title")
-        artist = info.get("artist") or ""
-        if title:
-            search_q = f"ytsearch1:{title} {artist}"
-            return search_q
-    except Exception:
-        # 抓不到就當一般文字搜尋處理
-        pass
-
-    return query
+    # 簡化：直接用關鍵字搜尋，不實際連 Spotify API
+    # 讓使用者自行輸入歌名 / 複製歌名也可以
+    return query  # 這裡先不做實作，未來你要可以加 API
 
 
 # ============================================================
-# 工具：用 yt-dlp 抓 metadata（不下載檔案）
+# 小工具：取得單首歌曲資訊（不下載）
 # ============================================================
-def get_track_info(url_or_query: str) -> dict:
-    """
-    傳回：
-    {
-      "webpage_url": 原始頁面或搜尋結果URL,
-      "title": 標題,
-      "duration": 秒數(int) 或 None,
-      "thumbnail": 圖片URL 或 None
-    }
-    """
-    query = maybe_convert_spotify_to_search(url_or_query)
+def get_track_info(query: str) -> Track:
+    q = maybe_convert_spotify_to_search(query)
 
-    # 如果不是網址，就當成 ytsearch 搜尋
-    if not (query.startswith("http://") or query.startswith("https://")):
-        query = f"ytsearch1:{query}"
+    # 如果不是網址，就當成關鍵字搜尋
+    if not (q.startswith("http://") or q.startswith("https://")):
+        q = f"ytsearch1:{q}"
 
-    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-        info = ydl.extract_info(query, download=False)
+    ydl_opts = dict(YDL_OPTS_BASE)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(q, download=False)
 
-    # 如果是搜尋結果，會在 "entries" 裡
     if "entries" in info:
         info = info["entries"][0]
 
     return {
         "webpage_url": info.get("webpage_url") or info.get("url"),
-        "title": info.get("title", "Unknown Title"),
-        "duration": info.get("duration") or 0,
+        "title": info.get("title", "未知標題"),
+        "duration": str(info.get("duration") or 0),
         "thumbnail": info.get("thumbnail"),
+        "uploader": info.get("uploader"),
     }
+
+
+# ============================================================
+# 小工具：從 URL 取得實際音訊串流 URL
+# ============================================================
+def get_audio_url(webpage_url: str) -> str:
+    with yt_dlp.YoutubeDL(YDL_OPTS_BASE) as ydl:
+        info = ydl.extract_info(webpage_url, download=False)
+    return info["url"]
 
 
 # ============================================================
@@ -121,7 +123,7 @@ async def play_next(guild_id: int, vc: discord.VoiceClient):
     if guild_id not in loop_flags:
         loop_flags[guild_id] = False
 
-    track = None
+    track: Optional[Track] = None
 
     if loop_flags[guild_id] and now_playing.get(guild_id):
         # 單曲循環：再播一次現在這首
@@ -134,52 +136,128 @@ async def play_next(guild_id: int, vc: discord.VoiceClient):
         track = queues[guild_id].pop(0)
         now_playing[guild_id] = track
 
-    # 用 yt-dlp 取得實際音訊串流 URL
-    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-        info = ydl.extract_info(track["webpage_url"], download=False)
-    audio_url = info["url"]
+        # 更新播放歷史
+        if guild_id not in history:
+            history[guild_id] = []
+        history[guild_id].append(track)
+        history[guild_id] = history[guild_id][-50:]  # 只留最近 50 首
 
+        if guild_id not in play_counts:
+            play_counts[guild_id] = {}
+        title = track.get("title") or "未知標題"
+        play_counts[guild_id][title] = play_counts[guild_id].get(title, 0) + 1
+
+    if track is None:
+        return
+
+    audio_url = get_audio_url(track["webpage_url"])  # type: ignore
     source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTS)
-    start_times[guild_id] = datetime.now(timezone.utc)
 
-    def after_play(err: Exception | None):
+    vol = volume_settings.get(guild_id, 1.0)
+    source = discord.PCMVolumeTransformer(source, volume=vol)
+
+    start_times[guild_id] = datetime.now(timezone.utc)
+    touch_active(guild_id)
+
+    def after_play(err: Optional[Exception]):
         if err:
-            print("Player error:", err)
+            print("播放錯誤:", err)
         fut = asyncio.run_coroutine_threadsafe(
             play_next(guild_id, vc), bot.loop
         )
         try:
             fut.result()
         except Exception as e:
-            print("Error in after_play:", e)
+            print("after_play 發生錯誤:", e)
 
     vc.play(source, after=after_play)
 
 
 # ============================================================
-# 工具：確保連線到語音房
+# 自動斷線背景任務
 # ============================================================
-async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
+async def auto_disconnect_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        now = datetime.now(timezone.utc)
+        for guild in bot.guilds:
+            vc: discord.VoiceClient = guild.voice_client  # type: ignore
+            if not vc or not vc.is_connected():
+                continue
+
+            guild_id = guild.id
+            last = last_active.get(guild_id)
+            if not last:
+                continue
+
+            idle_seconds = (now - last).total_seconds()
+            # 語音頻道中是否有非機器人的成員
+            channel = vc.channel
+            if not channel:
+                continue
+            non_bot_members = [m for m in channel.members if not m.bot]
+
+            # 條件：沒人聽歌，或沒在播且佇列空 & 閒置 > 300 秒
+            if (not non_bot_members or (not vc.is_playing() and not queues.get(guild_id))) and idle_seconds > 300:
+                try:
+                    await vc.disconnect()
+                    now_playing[guild_id] = None
+                    queues[guild_id] = []
+                    loop_flags[guild_id] = False
+                    start_times[guild_id] = None
+                    print(f"自動斷線：guild {guild_id}")
+                except Exception as e:
+                    print("自動斷線錯誤:", e)
+        await asyncio.sleep(60)
+
+
+# ============================================================
+# 工具：確保在語音頻道
+# ============================================================
+async def ensure_voice(interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("❌ 你需要先加入一個語音頻道！", ephemeral=True)
         return None
 
     voice_channel = interaction.user.voice.channel
-    vc = interaction.guild.voice_client
+    vc: discord.VoiceClient = interaction.guild.voice_client  # type: ignore
 
     if vc is None:
         vc = await voice_channel.connect()
     elif vc.channel != voice_channel:
         await vc.move_to(voice_channel)
 
+    touch_active(interaction.guild_id)
     return vc
 
 
 # ============================================================
-# 指令： /play
+# 進度條工具
 # ============================================================
-@tree.command(name="play", description="播放音樂（支援 YouTube 連結、關鍵字搜尋、Spotify 歌曲連結）")
-async def play(interaction: discord.Interaction, query: str):
+def build_progress_bar(elapsed: int, duration: int, length: int = 20) -> str:
+    if duration <= 0:
+        return "🔘" + "▬" * (length - 1)
+
+    ratio = min(max(elapsed / duration, 0.0), 1.0)
+    pos = int(length * ratio)
+    bar = ""
+    for i in range(length):
+        if i == pos:
+            bar += "🔘"
+        else:
+            bar += "▬"
+    return bar
+
+
+def fmt_time(sec: int) -> str:
+    return f"{sec // 60:02d}:{sec % 60:02d}"
+
+
+# ============================================================
+# Slash 指令：/play
+# ============================================================
+@tree.command(name="play", description="播放音樂（支援YouTube/關鍵字/Spotify單曲連結）")
+async def play_cmd(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
 
     guild_id = interaction.guild_id
@@ -197,18 +275,19 @@ async def play(interaction: discord.Interaction, query: str):
         queues[guild_id] = []
     queues[guild_id].append(track)
 
-    # 建立排隊 Embed
+    # 建立佇列 Embed
     embed = discord.Embed(
         title="🎶 已加入佇列",
         description=f"**{track['title']}**",
         color=discord.Color.blurple(),
     )
     embed.add_field(name="來源", value=track["webpage_url"], inline=False)
-    if track["duration"]:
-        mins = track["duration"] // 60
-        secs = track["duration"] % 60
-        embed.add_field(name="長度", value=f"{mins:02d}:{secs:02d}", inline=True)
-    if track["thumbnail"]:
+    if track.get("duration"):
+        d = int(track["duration"])  # type: ignore
+        embed.add_field(name="長度", value=f"{fmt_time(d)}", inline=True)
+    if track.get("uploader"):
+        embed.add_field(name="頻道", value=track["uploader"], inline=True)
+    if track.get("thumbnail"):
         embed.set_thumbnail(url=track["thumbnail"])
 
     await interaction.followup.send(embed=embed)
@@ -218,7 +297,90 @@ async def play(interaction: discord.Interaction, query: str):
 
 
 # ============================================================
-# 指令： /queue
+# Slash 指令：/search（多結果選歌）
+# ============================================================
+class SearchView(discord.ui.View):
+    def __init__(self, user_id: int, results: List[Track], guild_id: int, timeout: int = 30):
+        super().__init__(timeout=timeout)
+        self.user_id = user_id
+        self.results = results
+        self.guild_id = guild_id
+        for i, track in enumerate(results[:5], start=1):
+            label = f"{i}"
+            self.add_item(SearchButton(label=label, track=track, view=self))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # 限制只有發指令的人可以按
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("這個選單只限原指令發送者使用。", ephemeral=True)
+            return False
+        return True
+
+
+class SearchButton(discord.ui.Button):
+    def __init__(self, label: str, track: Track, view: SearchView):
+        super().__init__(style=discord.ButtonStyle.primary, label=label)
+        self.track = track
+        self.parent_view = view
+
+    async def callback(self, interaction: discord.Interaction):
+        guild_id = interaction.guild_id
+        vc = await ensure_voice(interaction)
+        if vc is None:
+            return
+
+        if guild_id not in queues:
+            queues[guild_id] = []
+        queues[guild_id].append(self.track)
+
+        if not vc.is_playing():
+            await play_next(guild_id, vc)
+
+        await interaction.response.edit_message(
+            content=f"✅ 已選擇並加入佇列：**{self.track['title']}**",
+            view=None
+        )
+
+
+@tree.command(name="search", description="搜尋歌曲並從多個結果中選擇播放")
+async def search_cmd(interaction: discord.Interaction, keyword: str):
+    await interaction.response.defer(ephemeral=True)
+
+    q = f"ytsearch5:{keyword}"
+    with yt_dlp.YoutubeDL(YDL_OPTS_BASE) as ydl:
+        info = ydl.extract_info(q, download=False)
+
+    entries = info.get("entries", [])[:5]
+    if not entries:
+        await interaction.followup.send("❌ 找不到相關歌曲。", ephemeral=True)
+        return
+
+    results: List[Track] = []
+    desc_lines = []
+    for i, e in enumerate(entries, start=1):
+        t = {
+            "webpage_url": e.get("webpage_url") or e.get("url"),
+            "title": e.get("title", "未知標題"),
+            "duration": str(e.get("duration") or 0),
+            "thumbnail": e.get("thumbnail"),
+            "uploader": e.get("uploader"),
+        }
+        results.append(t)
+        d = int(t["duration"]) if t["duration"] else 0
+        desc_lines.append(f"`{i}.` {t['title']} （{fmt_time(d)}）")
+
+    embed = discord.Embed(
+        title=f"🔍 搜尋結果：{keyword}",
+        description="\n".join(desc_lines),
+        color=discord.Color.green(),
+    )
+
+    view = SearchView(interaction.user.id, results, interaction.guild_id)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+# ============================================================
+# Slash 指令：/queue & /clearqueue
 # ============================================================
 @tree.command(name="queue", description="查看目前播放佇列")
 async def queue_cmd(interaction: discord.Interaction):
@@ -226,63 +388,120 @@ async def queue_cmd(interaction: discord.Interaction):
     q = queues.get(guild_id, [])
 
     if not q:
-        await interaction.response.send_message("📭 目前佇列是空的！")
+        await interaction.response.send_message("📭 目前佇列是空的。")
         return
 
-    desc_lines = []
+    lines = []
     for i, t in enumerate(q, start=1):
-        desc_lines.append(f"`{i}.` {t['title']}")
+        d = int(t["duration"]) if t.get("duration") else 0
+        lines.append(f"`{i}.` {t['title']} （{fmt_time(d)}）")
 
     embed = discord.Embed(
         title="📜 播放佇列",
-        description="\n".join(desc_lines),
-        color=discord.Color.green(),
+        description="\n".join(lines),
+        color=discord.Color.teal(),
     )
     await interaction.response.send_message(embed=embed)
 
 
+@tree.command(name="clearqueue", description="清空佇列（不影響目前播放）")
+async def clearqueue_cmd(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    queues[guild_id] = []
+    await interaction.response.send_message("🧹 已清空佇列（目前播放中的歌曲不受影響）。")
+
+
 # ============================================================
-# 工具：進度條 & /nowplaying
+# Slash 指令：/skip /loop /pause /resume /stop /leave
 # ============================================================
-def build_progress_bar(elapsed: int, duration: int, bar_len: int = 20) -> str:
-    if duration <= 0:
-        return "🔘" + "▬" * (bar_len - 1)
-
-    ratio = min(max(elapsed / duration, 0), 1)
-    pos = int(bar_len * ratio)
-    bar = ""
-    for i in range(bar_len):
-        if i == pos:
-            bar += "🔘"
-        else:
-            bar += "▬"
-    return bar
+@tree.command(name="skip", description="跳過目前這首歌")
+async def skip_cmd(interaction: discord.Interaction):
+    vc: discord.VoiceClient = interaction.guild.voice_client  # type: ignore
+    if not vc or not vc.is_playing():
+        await interaction.response.send_message("❌ 目前沒有正在播放的歌曲。")
+        return
+    vc.stop()
+    touch_active(interaction.guild_id)
+    await interaction.response.send_message("⏭ 已跳過目前歌曲。")
 
 
-@tree.command(name="nowplaying", description="顯示目前播放中的歌曲")
-async def nowplaying(interaction: discord.Interaction):
+@tree.command(name="loop", description="設定是否開啟單曲循環（true=開 / false=關）")
+async def loop_cmd(interaction: discord.Interaction, enabled: bool):
+    guild_id = interaction.guild_id
+    loop_flags[guild_id] = enabled
+    msg = "🔁 已開啟單曲循環。" if enabled else "⏹ 已關閉單曲循環。"
+    await interaction.response.send_message(msg)
+
+
+@tree.command(name="pause", description="暫停播放")
+async def pause_cmd(interaction: discord.Interaction):
+    vc: discord.VoiceClient = interaction.guild.voice_client  # type: ignore
+    if not vc or not vc.is_playing():
+        await interaction.response.send_message("❌ 目前沒有正在播放的歌曲。")
+        return
+    vc.pause()
+    touch_active(interaction.guild_id)
+    await interaction.response.send_message("⏸ 已暫停播放。")
+
+
+@tree.command(name="resume", description="繼續播放")
+async def resume_cmd(interaction: discord.Interaction):
+    vc: discord.VoiceClient = interaction.guild.voice_client  # type: ignore
+    if not vc or not vc.is_paused():
+        await interaction.response.send_message("❌ 沒有暫停中的歌曲。")
+        return
+    vc.resume()
+    touch_active(interaction.guild_id)
+    await interaction.response.send_message("▶ 已繼續播放。")
+
+
+@tree.command(name="stop", description="停止播放並清空佇列")
+async def stop_cmd(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    queues[guild_id] = []
+    loop_flags[guild_id] = False
+    now_playing[guild_id] = None
+    start_times[guild_id] = None
+
+    vc: discord.VoiceClient = interaction.guild.voice_client  # type: ignore
+    if vc and (vc.is_playing() or vc.is_paused()):
+        vc.stop()
+
+    await interaction.response.send_message("⏹ 已停止播放並清空佇列。")
+
+
+@tree.command(name="leave", description="讓機器人離開語音頻道")
+async def leave_cmd(interaction: discord.Interaction):
+    vc: discord.VoiceClient = interaction.guild.voice_client  # type: ignore
+    if not vc:
+        await interaction.response.send_message("❌ 我目前不在任何語音頻道裡。")
+        return
+    await vc.disconnect()
+    await interaction.response.send_message("👋 已離開語音頻道。")
+
+
+# ============================================================
+# Slash 指令：/nowplaying（進度條 + 封面）
+# ============================================================
+@tree.command(name="nowplaying", description="顯示目前正在播放的歌曲")
+async def nowplaying_cmd(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     track = now_playing.get(guild_id)
-
     if not track:
-        await interaction.response.send_message("🎧 目前沒有正在播放的歌曲")
+        await interaction.response.send_message("🎧 目前沒有正在播放的歌曲。")
         return
 
-    duration = track.get("duration") or 0
+    duration = int(track.get("duration") or 0)
     started = start_times.get(guild_id)
     if started:
         elapsed = int((datetime.now(timezone.utc) - started).total_seconds())
     else:
         elapsed = 0
 
-    elapsed = max(0, min(elapsed, duration if duration > 0 else elapsed))
-
-    # 時間字串
-    def fmt(t: int) -> str:
-        return f"{t // 60:02d}:{t % 60:02d}"
+    if duration > 0:
+        elapsed = max(0, min(elapsed, duration))
 
     bar = build_progress_bar(elapsed, duration)
-
     embed = discord.Embed(
         title="🎧 正在播放",
         description=f"**[{track['title']}]({track['webpage_url']})**",
@@ -291,9 +510,11 @@ async def nowplaying(interaction: discord.Interaction):
     if duration > 0:
         embed.add_field(
             name="進度",
-            value=f"`{fmt(elapsed)} / {fmt(duration)}`\n{bar}",
+            value=f"`{fmt_time(elapsed)} / {fmt_time(duration)}`\n{bar}",
             inline=False,
         )
+    if track.get("uploader"):
+        embed.add_field(name="頻道", value=track["uploader"], inline=True)
     if track.get("thumbnail"):
         embed.set_thumbnail(url=track["thumbnail"])
 
@@ -301,85 +522,169 @@ async def nowplaying(interaction: discord.Interaction):
 
 
 # ============================================================
-# 指令： /skip
+# Slash 指令：/volume（0~200%）
 # ============================================================
-@tree.command(name="skip", description="跳過目前這首歌")
-async def skip(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if not vc or not vc.is_playing():
-        await interaction.response.send_message("❌ 目前沒有正在播放的歌曲")
+@tree.command(name="volume", description="調整音量（0~200）")
+async def volume_cmd(interaction: discord.Interaction, volume: int):
+    if volume < 0 or volume > 200:
+        await interaction.response.send_message("❌ 音量範圍為 0 ~ 200。", ephemeral=True)
         return
 
-    vc.stop()
-    await interaction.response.send_message("⏭ 已跳過！")
-
-
-# ============================================================
-# 指令： /loop
-# ============================================================
-@tree.command(name="loop", description="切換單曲循環（true=開 / false=關）")
-async def loop(interaction: discord.Interaction, enabled: bool):
     guild_id = interaction.guild_id
-    loop_flags[guild_id] = enabled
-    status = "✅ 已開啟單曲循環" if enabled else "⏹ 已關閉單曲循環"
-    await interaction.response.send_message(status)
+    volume_settings[guild_id] = volume / 100.0
+
+    vc: discord.VoiceClient = interaction.guild.voice_client  # type: ignore
+    if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+        vc.source.volume = volume_settings[guild_id]
+
+    await interaction.response.send_message(f"🔊 已將音量設定為 {volume}%。")
 
 
 # ============================================================
-# 指令： /pause /resume /stop /leave
+# Slash 指令：/playlist（加入 YouTube 播放清單）
 # ============================================================
-@tree.command(name="pause", description="暫停播放")
-async def pause(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if not vc or not vc.is_playing():
-        await interaction.response.send_message("❌ 沒有正在播放的歌曲")
-        return
-    vc.pause()
-    await interaction.response.send_message("⏸ 已暫停")
+@tree.command(name="playlist", description="加入整個 YouTube 播放清單（預設最多50首）")
+async def playlist_cmd(interaction: discord.Interaction, url: str, limit: int = 50):
+    await interaction.response.defer()
 
-
-@tree.command(name="resume", description="繼續播放")
-async def resume(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if not vc or not vc.is_paused():
-        await interaction.response.send_message("❌ 沒有暫停中的歌曲")
-        return
-    vc.resume()
-    await interaction.response.send_message("▶ 已繼續播放")
-
-
-@tree.command(name="stop", description="停止播放並清空佇列")
-async def stop(interaction: discord.Interaction):
     guild_id = interaction.guild_id
-    queues[guild_id] = []
-    loop_flags[guild_id] = False
-    now_playing[guild_id] = None
-    start_times[guild_id] = None
-
-    vc = interaction.guild.voice_client
-    if vc and (vc.is_playing() or vc.is_paused()):
-        vc.stop()
-
-    await interaction.response.send_message("⏹ 已停止播放並清空佇列")
-
-
-@tree.command(name="leave", description="讓機器人離開語音頻道")
-async def leave(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if not vc:
-        await interaction.response.send_message("❌ 我現在不在任何語音頻道")
+    vc = await ensure_voice(interaction)
+    if vc is None:
         return
-    await vc.disconnect()
-    await interaction.response.send_message("👋 已離開語音頻道")
+
+    try:
+        ydl_opts = dict(YDL_OPTS_BASE)
+        ydl_opts["extract_flat"] = "in_playlist"
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 讀取播放清單失敗：{e}")
+        return
+
+    entries = info.get("entries", [])[:max(1, min(limit, 100))]
+    if not entries:
+        await interaction.followup.send("❌ 播放清單中沒有可用的音樂。")
+        return
+
+    if guild_id not in queues:
+        queues[guild_id] = []
+
+    count = 0
+    for e in entries:
+        t = {
+            "webpage_url": e.get("url") or e.get("webpage_url"),
+            "title": e.get("title", "未知標題"),
+            "duration": str(e.get("duration") or 0),
+            "thumbnail": e.get("thumbnail"),
+            "uploader": e.get("uploader"),
+        }
+        queues[guild_id].append(t)
+        count += 1
+
+    await interaction.followup.send(f"📑 已從播放清單加入 {count} 首歌曲到佇列。")
+
+    if not vc.is_playing():
+        await play_next(guild_id, vc)
 
 
 # ============================================================
-# Bot 啟動
+# Slash 指令：/lyrics（給目前歌曲的歌詞搜尋連結）
+# ============================================================
+@tree.command(name="lyrics", description="顯示目前歌曲的歌詞搜尋連結")
+async def lyrics_cmd(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    track = now_playing.get(guild_id)
+    if not track:
+        await interaction.response.send_message("🎧 目前沒有正在播放的歌曲。")
+        return
+
+    title = track.get("title") or ""
+    if not title:
+        await interaction.response.send_message("❌ 找不到歌曲標題，無法搜尋歌詞。")
+        return
+
+    query = f"{title} 歌詞"
+    url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+    embed = discord.Embed(
+        title="📖 歌詞搜尋",
+        description=f"點此搜尋 **{title}** 的歌詞：\n{url}",
+        color=discord.Color.purple(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+# ============================================================
+# Slash 指令：/history /top /recommend
+# ============================================================
+@tree.command(name="history", description="顯示最近播放紀錄（最多20首）")
+async def history_cmd(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    h = history.get(guild_id, [])
+    if not h:
+        await interaction.response.send_message("📭 尚無播放紀錄。")
+        return
+
+    lines = []
+    for i, t in enumerate(h[-20:], start=1):
+        lines.append(f"`{i}.` {t.get('title', '未知標題')}")
+    embed = discord.Embed(
+        title="📚 最近播放紀錄",
+        description="\n".join(lines),
+        color=discord.Color.blue(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="top", description="顯示本伺服器最常播放的前10首歌")
+async def top_cmd(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    pc = play_counts.get(guild_id, {})
+    if not pc:
+        await interaction.response.send_message("📭 尚無統計資料。")
+        return
+
+    sorted_items = sorted(pc.items(), key=lambda x: x[1], reverse=True)[:10]
+    lines = []
+    for i, (title, cnt) in enumerate(sorted_items, start=1):
+        lines.append(f"`{i}.` {title}（播放 {cnt} 次）")
+
+    embed = discord.Embed(
+        title="🏆 最常播放 TOP 10",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="recommend", description="根據歷史播放推薦一首常播放的歌曲")
+async def recommend_cmd(interaction: discord.Interaction):
+    import random
+
+    guild_id = interaction.guild_id
+    pc = play_counts.get(guild_id, {})
+    if not pc:
+        await interaction.response.send_message("📭 尚無播放紀錄可以推薦。")
+        return
+
+    # 加權隨機（播放越多次，被選到的機率越高）
+    titles = list(pc.keys())
+    weights = [pc[t] for t in titles]
+    chosen_title = random.choices(titles, weights=weights, k=1)[0]
+
+    await interaction.response.send_message(f"🤖 推薦你再聽一次：**{chosen_title}**（依照播放次數推薦）")
+
+
+# ============================================================
+# Bot 啟動事件
 # ============================================================
 @bot.event
 async def on_ready():
     await tree.sync()
     print(f"🤖 已登入：{bot.user} (ID: {bot.user.id})")
+
+    # 啟動自動斷線背景任務
+    if not hasattr(bot, "auto_dc_task"):
+        bot.auto_dc_task = bot.loop.create_task(auto_disconnect_loop())
 
 
 if __name__ == "__main__":
