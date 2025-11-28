@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import yt_dlp
@@ -15,11 +14,11 @@ import yt_dlp
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# ffmpeg 路徑（Railway / Docker 預設）
+# Railway / Docker 預設 ffmpeg 路徑（可以用環境變數覆蓋）
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
 
 # ============================================================
-# Bot Intents
+# Bot & Intents 設定
 # ============================================================
 intents = discord.Intents.default()
 intents.message_content = True
@@ -36,7 +35,6 @@ YDL_OPTS_BASE = {
     "format": "bestaudio/best",
     "quiet": True,
     "nocheckcertificate": True,
-    "extractor_args": {"youtube": {"player_client": "default"}},  # 去除 JS 警告
 }
 
 FFMPEG_OPTS = {
@@ -46,40 +44,43 @@ FFMPEG_OPTS = {
 }
 
 # ============================================================
-# 狀態儲存
+# 狀態儲存（依 guild 分開）
 # ============================================================
 Track = Dict[str, Optional[str]]
 
-queues: Dict[int, List[Track]] = {}
-now_playing: Dict[int, Optional[Track]] = {}
-loop_flags: Dict[int, bool] = {}
+queues: Dict[int, List[Track]] = {}          # guild_id -> [track, ...]
+now_playing: Dict[int, Optional[Track]] = {} # guild_id -> track
+loop_flags: Dict[int, bool] = {}             # guild_id -> 是否單曲循環
 start_times: Dict[int, Optional[datetime]] = {}
-volume_settings: Dict[int, float] = {}
-last_active: Dict[int, datetime] = {}
+volume_settings: Dict[int, float] = {}       # 0.0 ~ 2.0，預設 1.0
+last_active: Dict[int, datetime] = {}        # 最後活躍時間
 
-history: Dict[int, List[Track]] = {}
-play_counts: Dict[int, Dict[str, int]] = {}
+# 播放歷史 & 次數統計
+history: Dict[int, List[Track]] = {}         # guild_id -> 最近播放列表
+play_counts: Dict[int, Dict[str, int]] = {}  # guild_id -> title -> count
 
 # ============================================================
-# 活躍更新
+# 小工具：更新最後活躍時間
 # ============================================================
 def touch_active(guild_id: int):
     last_active[guild_id] = datetime.now(timezone.utc)
 
 # ============================================================
-# Spotify 轉換（目前保留接口）
+# 小工具：Spotify 連結轉搜尋（目前只是保留介面）
 # ============================================================
 def maybe_convert_spotify_to_search(query: str) -> str:
     if "open.spotify.com/track" not in query:
         return query
-    return query  # 未實作的介面
+    # 之後可在這裡真的把 Spotify 轉成歌名
+    return query
 
 # ============================================================
-# 取得歌曲資訊（不下載）
+# 小工具：取得單首歌曲資訊（不下載）
 # ============================================================
 def get_track_info(query: str) -> Track:
     q = maybe_convert_spotify_to_search(query)
 
+    # 如果不是網址，就當成關鍵字搜尋
     if not (q.startswith("http://") or q.startswith("https://")):
         q = f"ytsearch1:{q}"
 
@@ -92,6 +93,7 @@ def get_track_info(query: str) -> Track:
 
     webpage_url = info.get("webpage_url") or info.get("url") or ""
     if webpage_url and not webpage_url.startswith("http"):
+        # 有些時候只給 id
         webpage_url = f"https://www.youtube.com/watch?v={webpage_url}"
 
     return {
@@ -103,7 +105,7 @@ def get_track_info(query: str) -> Track:
     }
 
 # ============================================================
-# 抓音訊 URL
+# 小工具：從 URL 取得實際音訊串流 URL
 # ============================================================
 def get_audio_url(webpage_url: str) -> str:
     with yt_dlp.YoutubeDL(YDL_OPTS_BASE) as ydl:
@@ -111,7 +113,7 @@ def get_audio_url(webpage_url: str) -> str:
     return info["url"]
 
 # ============================================================
-# 播放下一首
+# 核心：播放下一首
 # ============================================================
 async def play_next(guild_id: int, vc: discord.VoiceClient):
     if guild_id not in queues:
@@ -119,9 +121,10 @@ async def play_next(guild_id: int, vc: discord.VoiceClient):
     if guild_id not in loop_flags:
         loop_flags[guild_id] = False
 
-    track = None
+    track: Optional[Track] = None
 
     if loop_flags[guild_id] and now_playing.get(guild_id):
+        # 單曲循環：重播目前這首
         track = now_playing[guild_id]
     else:
         if not queues[guild_id]:
@@ -132,13 +135,12 @@ async def play_next(guild_id: int, vc: discord.VoiceClient):
         track = queues[guild_id].pop(0)
         now_playing[guild_id] = track
 
-        # 播放紀錄
+        # 更新播放歷史
         if guild_id not in history:
             history[guild_id] = []
         history[guild_id].append(track)
-        history[guild_id] = history[guild_id][-50:]
+        history[guild_id] = history[guild_id][-50:]  # 只留最近 50 首
 
-        # 次數統計
         if guild_id not in play_counts:
             play_counts[guild_id] = {}
         title = track.get("title") or "未知標題"
@@ -147,7 +149,7 @@ async def play_next(guild_id: int, vc: discord.VoiceClient):
     if not track:
         return
 
-    audio_url = get_audio_url(track["webpage_url"])
+    audio_url = get_audio_url(track["webpage_url"])  # type: ignore
     source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTS)
 
     vol = volume_settings.get(guild_id, 1.0)
@@ -156,30 +158,28 @@ async def play_next(guild_id: int, vc: discord.VoiceClient):
     start_times[guild_id] = datetime.now(timezone.utc)
     touch_active(guild_id)
 
-    def after_play(error: Exception):
-        if error:
-            print("播放錯誤:", error)
-
+    def after_play(err: Optional[Exception]):
+        if err:
+            print("播放錯誤:", err)
         fut = asyncio.run_coroutine_threadsafe(
             play_next(guild_id, vc), bot.loop
         )
         try:
             fut.result()
         except Exception as e:
-            print("after_play error:", e)
+            print("after_play 發生錯誤:", e)
 
     vc.play(source, after=after_play)
 
 # ============================================================
-# 自動斷線
+# 自動斷線背景任務（沒人聽 or 閒置太久）
 # ============================================================
 async def auto_disconnect_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         now = datetime.now(timezone.utc)
-
         for guild in bot.guilds:
-            vc: discord.VoiceClient = guild.voice_client
+            vc: discord.VoiceClient = guild.voice_client  # type: ignore
             if not vc or not vc.is_connected():
                 continue
 
@@ -189,35 +189,35 @@ async def auto_disconnect_loop():
                 continue
 
             idle_seconds = (now - last).total_seconds()
-
             channel = vc.channel
             if not channel:
                 continue
 
-            non_bot = [m for m in channel.members if not m.bot]
+            non_bot_members = [m for m in channel.members if not m.bot]
 
-            if (not non_bot or (not vc.is_playing() and not queues.get(guild_id))) and idle_seconds > 300:
+            # 5 分鐘沒人 / 沒在播歌 & 佇列空 → 自動離開
+            if (not non_bot_members or (not vc.is_playing() and not queues.get(guild_id))) and idle_seconds > 300:
                 try:
                     await vc.disconnect()
                     now_playing[guild_id] = None
                     queues[guild_id] = []
                     loop_flags[guild_id] = False
                     start_times[guild_id] = None
+                    print(f"自動斷線：guild {guild_id}")
                 except Exception as e:
                     print("自動斷線錯誤:", e)
-
         await asyncio.sleep(60)
 
 # ============================================================
-# 必須在語音頻道
+# 工具：確保使用者 & 機器人在同一語音頻道
 # ============================================================
-async def ensure_voice(interaction: discord.Interaction):
-    if not interaction.user.voice:
-        await interaction.response.send_message("❌ 你需要先加入語音頻道！")
+async def ensure_voice(interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("❌ 你需要先加入一個語音頻道！", ephemeral=True)
         return None
 
     voice_channel = interaction.user.voice.channel
-    vc = interaction.guild.voice_client
+    vc: discord.VoiceClient = interaction.guild.voice_client  # type: ignore
 
     if vc is None:
         vc = await voice_channel.connect()
@@ -228,23 +228,25 @@ async def ensure_voice(interaction: discord.Interaction):
     return vc
 
 # ============================================================
-# 進度條
+# 進度條工具
 # ============================================================
-def build_progress_bar(elapsed, duration, length=20):
+def build_progress_bar(elapsed: int, duration: int, length: int = 20) -> str:
     if duration <= 0:
         return "🔘" + "▬" * (length - 1)
 
-    ratio = min(max(elapsed / duration, 0), 1)
+    ratio = min(max(elapsed / duration, 0.0), 1.0)
     pos = int(length * ratio)
-
     bar = ""
     for i in range(length):
-        bar += "🔘" if i == pos else "▬"
+        if i == pos:
+            bar += "🔘"
+        else:
+            bar += "▬"
     return bar
 
-
-def fmt_time(sec):
+def fmt_time(sec: int) -> str:
     return f"{sec // 60:02d}:{sec % 60:02d}"
+
 # ============================================================
 # /play 指令
 # ============================================================
@@ -323,7 +325,7 @@ class SearchButton(discord.ui.Button):
             await play_next(guild_id, vc)
 
         await interaction.response.edit_message(
-            content=f"已加入：**{self.track['title']}**",
+            content=f"✅ 已加入佇列：**{self.track['title']}**",
             view=None
         )
 
@@ -350,7 +352,7 @@ async def search_cmd(interaction: discord.Interaction, keyword: str):
 
         t = {
             "webpage_url": url,
-            "title": e.get("title", "未知"),
+            "title": e.get("title", "未知標題"),
             "duration": str(e.get("duration") or 0),
             "thumbnail": e.get("thumbnail"),
             "uploader": e.get("uploader"),
@@ -373,7 +375,7 @@ async def search_cmd(interaction: discord.Interaction, keyword: str):
     )
 
 # ============================================================
-# /queue
+# /queue & /clearqueue
 # ============================================================
 @tree.command(name="queue", description="查看播放佇列")
 async def queue_cmd(interaction: discord.Interaction):
@@ -396,9 +398,7 @@ async def queue_cmd(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed)
 
-# ============================================================
-# /clearqueue
-# ============================================================
+
 @tree.command(name="clearqueue", description="清空佇列")
 async def clearqueue_cmd(interaction: discord.Interaction):
     queues[interaction.guild_id] = []
@@ -430,6 +430,7 @@ async def pause_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("❌ 沒有歌曲在播放")
         return
     vc.pause()
+    touch_active(interaction.guild_id)
     await interaction.response.send_message("⏸ 已暫停")
 
 @tree.command(name="resume", description="繼續播放")
@@ -439,17 +440,19 @@ async def resume_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("❌ 沒有暫停中的歌曲")
         return
     vc.resume()
+    touch_active(interaction.guild_id)
     await interaction.response.send_message("▶ 已繼續")
 
 @tree.command(name="stop", description="停止播放並清空佇列")
 async def stop_cmd(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     queues[guild_id] = []
-    now_playing[guild_id] = None
     loop_flags[guild_id] = False
+    now_playing[guild_id] = None
+    start_times[guild_id] = None
 
     vc = interaction.guild.voice_client
-    if vc:
+    if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
 
     await interaction.response.send_message("⏹ 已停止播放並清空佇列")
@@ -535,25 +538,27 @@ async def playlist_cmd(interaction: discord.Interaction, url: str, limit: int = 
         await interaction.followup.send(f"❌ 播放清單讀取失敗：{e}")
         return
 
-    entries = info.get("entries", [])[:limit]
+    entries = info.get("entries", [])[:max(1, min(limit, 100))]
 
     guild_id = interaction.guild_id
     queues.setdefault(guild_id, [])
 
     for e in entries:
-        url = e.get("url") or e.get("webpage_url")
-        if not url.startswith("http"):
-            url = f"https://www.youtube.com/watch?v={url}"
+        u = e.get("url") or e.get("webpage_url")
+        if not u:
+            continue
+        if not u.startswith("http"):
+            u = f"https://www.youtube.com/watch?v={u}"
 
         queues[guild_id].append({
-            "webpage_url": url,
+            "webpage_url": u,
             "title": e.get("title", "未知標題"),
             "duration": str(e.get("duration") or 0),
             "thumbnail": e.get("thumbnail"),
             "uploader": e.get("uploader"),
         })
 
-    await interaction.followup.send(f"📑 已加入 {len(entries)} 首歌曲")
+    await interaction.followup.send(f"📑 已加入 {len(entries)} 首歌曲到佇列")
 
     if not vc.is_playing():
         await play_next(guild_id, vc)
@@ -635,19 +640,10 @@ async def recommend_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(f"🤖 推薦：**{chosen}**")
 
 # ============================================================
-# 管理指令（公開版本：任何伺服器都能用，但只有你能成功）
+# 管理指令（公開版：任何人都可以用）
 # ============================================================
-BOT_OWNER_ID = 477325882881605635  # <<< 這裡用你的 ID
-
-def is_owner(interaction: discord.Interaction) -> bool:
-    return interaction.user.id == BOT_OWNER_ID
-
-@tree.command(name="servers", description="顯示 Bot 加入的所有伺服器（僅限 Bot Owner）")
+@tree.command(name="servers", description="顯示 Bot 加入的所有伺服器")
 async def servers_cmd(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        await interaction.response.send_message("❌ 只有 Bot 擁有者能使用此指令。", ephemeral=True)
-        return
-
     guilds = bot.guilds
     if not guilds:
         await interaction.response.send_message("🤖 Bot 未加入任何伺服器。")
@@ -662,26 +658,12 @@ async def servers_cmd(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed)
 
-# ============================================================
-# /servercount（只有你能成功）
-# ============================================================
-@tree.command(name="servercount", description="顯示 bot 加入的伺服器數量（owner 限定）")
+@tree.command(name="servercount", description="顯示 bot 加入的伺服器數量")
 async def servercount_cmd(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        await interaction.response.send_message("❌ 你不是 Bot Owner。", ephemeral=True)
-        return
-
     await interaction.response.send_message(f"📊 伺服器數量：{len(bot.guilds)}")
 
-# ============================================================
-# /stats（只有你能成功）
-# ============================================================
-@tree.command(name="stats", description="查看所有伺服器當前播放（owner 限定）")
+@tree.command(name="stats", description="查看所有伺服器當前播放")
 async def stats_cmd(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        await interaction.response.send_message("❌ 你不是 Bot Owner。", ephemeral=True)
-        return
-
     lines = []
     for g in bot.guilds:
         t = now_playing.get(g.id)
@@ -697,12 +679,33 @@ async def stats_cmd(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed)
 
+@tree.command(name="leave_server", description="讓機器人離開指定伺服器（輸入伺服器 ID）")
+async def leave_server_cmd(interaction: discord.Interaction, guild_id: str):
+    try:
+        gid = int(guild_id)
+    except:
+        await interaction.response.send_message("❌ guild_id 格式錯誤，必須是數字。")
+        return
+
+    guild = bot.get_guild(gid)
+    if not guild:
+        await interaction.response.send_message("❌ 找不到這個伺服器，也許我不在裡面。")
+        return
+
+    try:
+        await guild.leave()
+        await interaction.response.send_message(f"👋 已成功離開伺服器：**{guild.name}**")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 離開伺服器時發生錯誤：{e}")
+
 # ============================================================
 # Bot 啟動
 # ============================================================
 @bot.event
 async def on_ready():
-    await tree.sync()
+    # 🔥 全域同步所有 Slash 指令
+    synced = await tree.sync(guild=None)
+    print(f"✨ 已全域同步 {len(synced)} 個指令")
     print(f"🤖 已登入：{bot.user}（ID: {bot.user.id}）")
 
     if not hasattr(bot, "auto_dc_task"):
